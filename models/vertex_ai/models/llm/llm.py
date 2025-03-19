@@ -6,7 +6,7 @@ from collections.abc import Generator
 from typing import Optional, Union, cast
 import google.auth.transport.requests
 import requests
-import vertexai.generative_models as glm
+import google.cloud.aiplatform_v1 as glm
 from anthropic import AnthropicVertex, Stream
 from anthropic.types import (
     ContentBlockDeltaEvent,
