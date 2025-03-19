@@ -738,6 +738,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         }
 
 
+
     def _convert_schema_for_vertex(self, schema):
         """
         Convert JSON schema to Vertex AI's expected format
