@@ -493,7 +493,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             generation_config_params["response_mime_type"] = "application/json"
         elif mime_type:
             generation_config_params["response_mime_type"] = mime_type
-        
+
         generation_config = glm.GenerationConfig(**generation_config_params)
         
         response = google_model.generate_content(
@@ -736,6 +736,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
                 exceptions.Cancelled,
             ],
         }
+
 
     def _convert_schema_for_vertex(self, schema):
         """
