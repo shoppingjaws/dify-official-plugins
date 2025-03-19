@@ -506,8 +506,9 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
             return self._handle_generate_stream_response(model, credentials, response, prompt_messages)
         return self._handle_generate_response(model, credentials, response, prompt_messages)
 
+
     def _handle_generate_response(
-        self, model: str, credentials: dict, response: glm.GenerationResponse, prompt_messages: list[PromptMessage]
+        self, model: str, credentials: dict, response: glm.GenerateContentResponse, prompt_messages: list[PromptMessage]
     ) -> LLMResult:
         """
         Handle llm response
@@ -518,6 +519,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         :param prompt_messages: prompt messages
         :return: llm response
         """
+
         assistant_prompt_message = AssistantPromptMessage(content=response.candidates[0].content.parts[0].text)
         prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
         completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
@@ -526,7 +528,7 @@ class VertexAiLargeLanguageModel(LargeLanguageModel):
         return result
 
     def _handle_generate_stream_response(
-        self, model: str, credentials: dict, response: glm.GenerationResponse, prompt_messages: list[PromptMessage]
+        self, model: str, credentials: dict, response: glm.GenerateContentResponse, prompt_messages: list[PromptMessage]
     ) -> Generator:
         """
         Handle llm stream response
