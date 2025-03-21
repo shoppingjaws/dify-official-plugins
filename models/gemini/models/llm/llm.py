@@ -4,15 +4,15 @@ import json
 import time
 import os
 from collections.abc import Generator
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 import requests
 import google.ai.generativelanguage as glm
-import google.generativeai as genai
+import google.genai as genai
+
 from google.api_core import exceptions
-from google.generativeai.types import ContentType, File, GenerateContentResponse
-from google.generativeai.types.content_types import to_part
-from dify_plugin.entities.model.llm import LLMResult, LLMResultChunk, LLMResultChunkDelta
+from google.genai.types import File, GenerateContentResponse, GenerateContentConfig,Tool, GoogleSearch, Part, Content
+from dify_plugin.entities.model.llm import LLMResult, LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
     PromptMessage,
@@ -22,6 +22,7 @@ from dify_plugin.entities.model.message import (
     SystemPromptMessage,
     ToolPromptMessage,
     UserPromptMessage,
+    TextPromptMessageContent
 )
 from dify_plugin.errors.model import (
     CredentialsValidateFailedError,
@@ -35,6 +36,8 @@ from dify_plugin.errors.model import (
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
 
 from .utils import FileCache
+from typing import Optional
+
 
 file_cache = FileCache()
 
@@ -160,21 +163,28 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
-        config_kwargs = model_parameters.copy()
-        if schema := config_kwargs.pop("json_schema", None):
+        print("model_parameters", model_parameters,"prompt_messages",prompt_messages,"tools",tools,"stop",stop,"stream",stream,"user",user)
+        config = GenerateContentConfig()
+        params = model_parameters.copy()
+        if schema := params.pop("json_schema", None):
             try:
                 schema = json.loads(schema)
             except:
                 raise exceptions.InvalidArgument("Invalid JSON Schema")
             if tools:
                 raise exceptions.InvalidArgument("gemini not support use Tools and JSON Schema at same time")
-            config_kwargs["response_schema"] = schema
-            config_kwargs["response_mime_type"] = "application/json"
+            config.response_schema = schema
+            config.response_mime_type = "application/json"
         if stop:
-            config_kwargs["stop_sequences"] = stop
-
-        genai.configure(api_key=credentials["google_api_key"])
-
+            config.stop_sequences = stop
+        if params.pop("grounding",None):
+            config.tools = [Tool(google_search=GoogleSearch())]
+        config.top_p = model_parameters.get("top_p", None)
+        config.top_k = model_parameters.get("top_k", None)
+        config.temperature = model_parameters.get("temperature", None)
+        config.max_output_tokens = model_parameters.get("max_output_tokens", None)
+        config.system_instruction = model_parameters.get("system_instruction", None)
+        print("config",config)
         history = []
         system_instruction = None
 
@@ -186,99 +196,48 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 system_instruction = content["parts"][0]
             else:
                 history.append(content)
-        
+        config.system_instruction = system_instruction
+        client = genai.Client(api_key=credentials["google_api_key"])
         if not history:
             raise InvokeError("The user prompt message is required. You only add a system prompt message.")
-
-        google_model = genai.GenerativeModel(model_name=model, system_instruction=system_instruction)
-        response = google_model.generate_content(
+        index = 0
+        for chunk in client.models.generate_content_stream(
+            model=model,
             contents=history,
-            generation_config=genai.types.GenerationConfig(**config_kwargs),
-            stream=stream,
-            tools=self._convert_tools_to_glm_tool(tools) if tools else None,
-            request_options={"timeout": 600},
-        )
-        if stream:
-            return self._handle_generate_stream_response(model, credentials, response, prompt_messages)
-        return self._handle_generate_response(model, credentials, response, prompt_messages)
-
-    def _handle_generate_response(
-        self, model: str, credentials: dict, response: GenerateContentResponse, prompt_messages: list[PromptMessage]
-    ) -> LLMResult:
-        """
-        Handle llm response
-
-        :param model: model name
-        :param credentials: credentials
-        :param response: response
-        :param prompt_messages: prompt messages
-        :return: llm response
-        """
-        assistant_prompt_message = AssistantPromptMessage(content=response.text)
-        if response.usage_metadata:
-            prompt_tokens = response.usage_metadata.prompt_token_count
-            completion_tokens = response.usage_metadata.candidates_token_count
-        else:
-            prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-            completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
-        usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
-        result = LLMResult(model=model, prompt_messages=prompt_messages, message=assistant_prompt_message, usage=usage)
-        return result
-
-    def _handle_generate_stream_response(
-        self, model: str, credentials: dict, response: GenerateContentResponse, prompt_messages: list[PromptMessage]
-    ) -> Generator:
-        """
-        Handle llm stream response
-
-        :param model: model name
-        :param credentials: credentials
-        :param response: response
-        :param prompt_messages: prompt messages
-        :return: llm response chunk generator result
-        """
-        index = -1
-        for chunk in response:
-            for part in chunk.parts:
-                assistant_prompt_message = AssistantPromptMessage(content="")
-                if part.text:
-                    assistant_prompt_message.content += part.text
-                if part.function_call:
-                    assistant_prompt_message.tool_calls = [
+            config=config,
+        ):
+            index += 1
+            assistant_prompt_message = AssistantPromptMessage(content="")
+            if chunk.text:
+                assistant_prompt_message.content += chunk.text
+            if chunk.function_calls:
+                assistant_prompt_message.tool_calls = [
                         AssistantPromptMessage.ToolCall(
-                            id=part.function_call.name,
+                            id=chunk.function_calls.name,
                             type="function",
                             function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                name=part.function_call.name,
-                                arguments=json.dumps(dict(part.function_call.args.items())),
+                                name=chunk.function_calls.name,
+                                arguments=json.dumps(dict(chunk.function_calls.args.items())),
                             ),
                         )
                     ]
-                index += 1
-                if not response._done:
-                    yield LLMResultChunk(
-                        model=model,
-                        prompt_messages=prompt_messages,
-                        delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
-                    )
-                else:
-                    if hasattr(response, "usage_metadata") and response.usage_metadata:
-                        prompt_tokens = response.usage_metadata.prompt_token_count
-                        completion_tokens = response.usage_metadata.candidates_token_count
-                    else:
-                        prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
-                        completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
-                    usage = self._calc_response_usage(model, credentials, prompt_tokens, completion_tokens)
-                    yield LLMResultChunk(
-                        model=model,
-                        prompt_messages=prompt_messages,
-                        delta=LLMResultChunkDelta(
-                            index=index,
-                            message=assistant_prompt_message,
-                            finish_reason=str(chunk.candidates[0].finish_reason),
-                            usage=usage,
-                        ),
-                    )
+            if chunk.usage_metadata:
+                prompt_tokens = chunk.usage_metadata.prompt_token_count
+                completion_tokens = chunk.usage_metadata.candidates_token_count
+            else:
+                prompt_tokens = self.get_num_tokens(model, credentials, prompt_messages)
+                completion_tokens = self.get_num_tokens(model, credentials, [assistant_prompt_message])
+            if chunk.candidates[0].finish_reason:
+                yield LLMResultChunk(
+                    model=model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message,finish_reason=chunk.candidates[0].finish_reason,usage=self._calc_response_usage(model,credentials,prompt_tokens,completion_tokens)),
+                )
+            yield LLMResultChunk(
+                model=model,
+                prompt_messages=prompt_messages,
+                delta=LLMResultChunkDelta(index=index, message=assistant_prompt_message),
+                )
 
     def _convert_one_message_to_text(self, message: PromptMessage) -> str:
         """
@@ -301,7 +260,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         else:
             raise ValueError(f"Got unknown type {message}")
         return message_text
-    
+
     def _upload_file_content_to_google(self, message_content: PromptMessageContent) -> File:
         key = f"{message_content.type.value}:{hash(message_content.data)}"
         if file_cache.exists(key):
@@ -336,7 +295,7 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             pass
         return file
 
-    def _format_message_to_glm_content(self, message: PromptMessage) -> ContentType:
+    def _format_message_to_glm_content(self, message: PromptMessage) -> Content:
         """
         Format a single message into glm.Content for Google API
 
@@ -346,11 +305,11 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         if isinstance(message, UserPromptMessage):
             glm_content = {"role": "user", "parts": []}
             if isinstance(message.content, str):
-                glm_content["parts"].append(to_part(message.content))
+                glm_content["parts"].append(Part.from_text(text=message.content))
             else:
                 for c in message.content:
                     if c.type == PromptMessageContentType.TEXT:
-                        glm_content["parts"].append(to_part(c.data))
+                        glm_content["parts"].append(Part.from_text(text=c.data))
                     else:
                         glm_content["parts"].append(self._upload_file_content_to_google(c))
 
@@ -358,10 +317,10 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         elif isinstance(message, AssistantPromptMessage):
             glm_content = {"role": "model", "parts": []}
             if message.content:
-                glm_content["parts"].append(to_part(message.content))
+                glm_content["parts"].append(Part.from_text(text=message.content))
             if message.tool_calls:
                 glm_content["parts"].append(
-                    to_part(
+                    Part.from_function_call(
                         glm.FunctionCall(
                             name=message.tool_calls[0].function.name,
                             args=json.loads(message.tool_calls[0].function.arguments),
@@ -370,15 +329,16 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
                 )
             return glm_content
         elif isinstance(message, SystemPromptMessage):
+            print("message.content",message.content)
             if isinstance(message.content, list):
                 text_contents = filter(lambda c: isinstance(c, TextPromptMessageContent), message.content)
                 message.content = "".join(c.data for c in text_contents)
-            return {"role": "system", "parts": [to_part(message.content)]}
+            return {"role": "system", "parts": [Part.from_text(text=message.content)]}
         elif isinstance(message, ToolPromptMessage):
             return {
                 "role": "function",
                 "parts": [
-                    glm.Part(
+                    Part(
                         function_response=glm.FunctionResponse(
                             name=message.name, response={"response": message.content}
                         )
